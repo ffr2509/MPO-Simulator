@@ -1,7 +1,7 @@
 // MPO Simulator offline support.
 // The page is fetched fresh whenever there is a connection (so updates show up),
 // and served from the saved copy when there is none.
-const CACHE = 'mpo-sim-v1';
+const CACHE = 'mpo-sim-v2';
 const FILES = ['./', 'index.html', 'manifest.webmanifest',
   'icons/apple-touch-icon.png', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'];
 

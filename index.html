@@ -96,6 +96,7 @@ button{font:inherit;color:inherit;border:0;cursor:pointer;touch-action:manipulat
 .track{position:relative;height:26px;margin-top:2px;border-radius:13px;background:linear-gradient(#050505,#2a2b2d);border:1.5px solid #555}
 .handle{position:absolute;top:-2px;width:36px;height:27px;border-radius:8px;border:1px solid #666;
   background:linear-gradient(#fff,#b9bcc0 45%,#74787d 55%,#e6e8ea);box-shadow:0 2px 4px #000}
+.ends span{padding:4px 6px;margin:-4px -6px;touch-action:none}
 .ends{display:flex;justify-content:space-between;font-size:8px;font-weight:800;letter-spacing:.4px;color:#bbb;padding:0 3px;line-height:10px}
 .hose{width:100%;display:flex;gap:4px;height:23px;margin-top:auto}
 .hose button{border-radius:5px;font-size:10px;font-weight:700;height:23px;white-space:nowrap}
@@ -352,12 +353,17 @@ function lineR(l){
 
            Rv: l.valve>0.01 ? 1/Math.pow(h.kv*l.valve*l.valve,2) : Infinity };
 }
+// Intake valve: hydrant pressure builds steadily as the valve is opened, so a slow open lets the
+// governor bring RPM down smoothly and a fast open produces a discharge spike.
+// Above the 5% seat, loss ~ (gpm/kd)^2 x (1 - opening)^2; fully open it is negligible.
+function inletK(th,kd,kmax){ if(th<=0.001) return 0; const seat=0.05;
+  const k=kd/(Math.max(0,1-Math.max(th,seat))+kd/kmax); return th<seat ? k*th/seat : k; }
 const supC=()=> st.hydInlet==='aux' ? CFG.c300 : 0.04;   // 3" into the 2½" aux inlet, otherwise 5" supply hose
 const effStatic=()=> st.sMain ? st.static*0.45 : st.static;
 function supplyR(){
   const aux = st.hydInlet==='aux', th = st.v[st.hydInlet].a;
   if(!st.hydrant || th<=0.01) return null;
-  const kin = (aux?500:2500)*th*th;
+  const kin = inletK(th, aux?14:28, aux?500:2500);
   return (st.q20>0 ? Math.max(1,effStatic()-20)/(st.q20*st.q20) : 0) + supC()*(st.supLen/100)/1e4 + 1/(kin*kin) + (st.sKink?6e-5:0);
 }
 function solve(n){
@@ -445,7 +451,7 @@ function step(dt){
   if(st.armed.length){ const due=st.armed.filter(a=>a.at!==null && st.t>=a.at); for(const a of due) fire(a); }
   // valve + nozzle travel
   for(const l of lines){ l.valve+=clamp(l.vT-l.valve,-2.5*dt,2.5*dt); l.nf+=clamp((l.nozOpen?1:0)-l.nf,-3*dt,3*dt); }
-  for(const k in st.v){ const v=st.v[k]; v.a+=clamp(v.t-v.a,-2.5*dt,2.5*dt); }
+  for(const k in st.v){ const v=st.v[k], r=(k==='main'||k==='rear'||k==='aux')?1.0:2.5; v.a+=clamp(v.t-v.a,-r*dt,r*dt); }  // intakes take ~1 s end to end
   governor(dt);
   st.rpm += (st.rpmCmd-st.rpm)*(1-Math.exp(-dt/0.35));
   const s=solve(st.rpm/1000);
@@ -515,16 +521,24 @@ function build(){
   refreshStatic();
   fitPlates();
 }
-function valveRef(key){ const [t,id]=key.split(':'); if(t==='L'){ const l=lines.find(x=>x.id===id); return { get:()=>l.valve, set:(v,snap)=>{ l.vT=v; if(!snap) l.valve=v; } }; }
-  const v=st.v[id]; return { get:()=>st.v[id].a, set:(x,snap)=>{ st.v[id].t=x; if(!snap) st.v[id].a=x; } }; }
+function valveRef(key){ const [t,id]=key.split(':'); if(t==='L'){ const l=lines.find(x=>x.id===id); return { get:()=>l.valve, tgt:()=>l.vT, set:(v,snap)=>{ l.vT=v; if(!snap) l.valve=v; } }; }
+  return { get:()=>st.v[id].a, tgt:()=>st.v[id].t, set:(x,snap)=>{ st.v[id].t=x; if(!snap) st.v[id].a=x; } }; }
 function bindValve(el){
   const track=el.querySelector('.track'), ends=el.querySelectorAll('.ends span');
   const from=e=>{ const r=track.getBoundingClientRect(), hw=r.width*36/ (track.offsetWidth||1)/2; return 1-clamp((e.clientX-r.left-hw)/(r.width-2*hw),0,1); };
   const ref=()=>valveRef(el.dataset.valve);
   track.addEventListener('pointerdown',e=>{ track.setPointerCapture(e.pointerId); ref().set(from(e)); e.preventDefault(); });
   track.addEventListener('pointermove',e=>{ if(track.hasPointerCapture(e.pointerId)) ref().set(from(e)); });
-  ends[0].addEventListener('pointerdown',e=>{ ref().set(1,true); e.stopPropagation(); });
-  ends[1].addEventListener('pointerdown',e=>{ ref().set(0,true); e.stopPropagation(); });
+  // quick tap on OPEN / CLOSED = all the way; press and hold = move slowly (about 10 s end to end) until released
+  const hold=(el2,dir)=>{ let t0=0, raf=0, last=0, moving=false;
+    const tick=now=>{ const dt=Math.min(0.1,(now-last)/1000); last=now;
+      if(now-t0>280){ moving=true; const r=ref(); r.set(clamp(r.tgt()+dir*0.1*dt,0,1),true); }
+      raf=requestAnimationFrame(tick); };
+    el2.addEventListener('pointerdown',e=>{ e.stopPropagation(); e.preventDefault(); try{ el2.setPointerCapture(e.pointerId); }catch(x){}
+      t0=last=performance.now(); moving=false; const r=ref(); r.set(r.get(),true); raf=requestAnimationFrame(tick); });
+    const end=()=>{ if(!t0) return; cancelAnimationFrame(raf); if(!moving) ref().set(dir>0?1:0,true); t0=0; };
+    el2.addEventListener('pointerup',end); el2.addEventListener('pointercancel',end); };
+  hold(ends[0],1); hold(ends[1],-1);
 }
 function refreshStatic(){
   for(const l of lines){
